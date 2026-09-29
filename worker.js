@@ -1,6 +1,6 @@
 // ============================================================
-//  Willhaben Wien Finder — Version 20.0
-//  Server-Side Rendering, Simplicity, Batched Logging
+//  Willhaben Wien Finder — Version 21.0
+//  Fixed: Working Tabs (Logs, Telegram, Settings)
 // ============================================================
 
 const WORKERS_AI_MODEL = "@cf/qwen/qwen3.8-27b";
@@ -15,6 +15,7 @@ const CRON_LOCK_TIMEOUT_MS = 300000;
 const CLEANUP_INTERVAL_MS = 600000;
 const LOG_RETENTION_HOURS = 48;
 const PER_PAGE = 20;
+const LOGS_PER_PAGE = 50;
 
 export default {
   async scheduled(event, env, ctx) { ctx.waitUntil(handleCron(env)); },
@@ -49,7 +50,6 @@ export default {
       if (action === "test") return handleTestSingleUser(env, chatId);
     }
 
-    // UI
     const response = await serveUI(env, url);
     const newHeaders = new Headers(response.headers);
     newHeaders.set("Cache-Control", "no-store");
@@ -109,35 +109,29 @@ async function clearAiQuotaExhausted(env) {
 async function handleCron(env) {
   const startTime = Date.now();
   const locked = await acquireCronLock(env);
-  if (!locked) {
-    console.log("⏭️ Cron läuft bereits — überspringe");
-    return;
-  }
+  if (!locked) { console.log("⏭️ Cron läuft bereits"); return; }
 
   console.log("⏰ Cron gestartet:", new Date().toISOString());
-  const successLogs = [];  // 🔧 Sammle alle Erfolge für Batch-Insert
+  const successLogs = [];
 
   try {
     const settings = await loadSettings(env);
 
-    // ۱. Scraping
     await scrapeWillhabenPages(env);
     console.log(`   ⏱️ Scraping: ${Date.now() - startTime}ms`);
 
-    // ۲. Extraction
     const quotaExhausted = await isAiQuotaExhausted(env);
     if (quotaExhausted) {
-      console.log("   ⚠️ AI Quota erschöpft — skip extraction");
+      console.log("   ⚠️ AI Quota erschöpft");
     } else if (Date.now() - startTime < TIME_BUDGET_MS - 12000) {
       await runExtractionStage(env, 3, successLogs);
       console.log(`   ⏱️ Extraction: ${Date.now() - startTime}ms`);
     }
 
-    // ۳. Jev
     await runJevStage(env, settings, 10, successLogs);
     console.log(`   ⏱️ Jev: ${Date.now() - startTime}ms`);
 
-    // ۴. Cleanup every 10 min
+    // Cleanup
     const cleanupRow = await env.DB.prepare(`SELECT updated_at FROM system_state WHERE key = 'last_cleanup'`).first();
     const lastCleanup = cleanupRow?.updated_at ? new Date(cleanupRow.updated_at.replace(' ', 'T') + 'Z').getTime() : 0;
     const lastCleanupSafe = Number.isNaN(lastCleanup) ? 0 : lastCleanup;
@@ -147,28 +141,24 @@ async function handleCron(env) {
         INSERT INTO system_state (key, value, updated_at) VALUES ('last_cleanup', '1', datetime('now'))
         ON CONFLICT(key) DO UPDATE SET updated_at = datetime('now')
       `).run();
-      console.log("   🧹 Cleanup done");
     }
 
-    // ۵. 🔧 Batch-Insert aller Success-Logs (۱ تراکنش به‌جای ۲۰ تراکنش)
+    // Batch success logs
     if (successLogs.length > 0) {
       const stmt = env.DB.prepare(`
         INSERT INTO request_logs (service, url, status, response_snippet, created_at)
         VALUES (?, ?, 200, ?, datetime('now'))
       `);
       const batch = successLogs.map(l => stmt.bind(
-        l.service,
-        (l.url || "").substring(0, 500),
-        (l.message || "").substring(0, 500)
+        l.service, (l.url || "").substring(0, 500), (l.message || "").substring(0, 500)
       ));
       await env.DB.batch(batch);
-      console.log(`   📝 ${successLogs.length} Erfolgs-Logs gespeichert`);
+      console.log(`   📝 ${successLogs.length} Success-Logs`);
     }
 
     console.log(`✅ Cron abgeschlossen in ${Date.now() - startTime}ms`);
   } catch (err) {
     console.error("❌ Cron Fehler:", err);
-    // Fehler sofort loggen
     await logError(env, "system", "cron", err.toString());
   } finally {
     await releaseCronLock(env);
@@ -295,7 +285,6 @@ async function runExtractionStage(env, limit, successLogs) {
     const sizeM2 = extraction.size_m2 || null;
     const totalCost = extraction.total_monthly_cost_eur || null;
 
-    // Edit-Detection
     if (address && sizeM2) {
       const dup = await env.DB.prepare(`
         SELECT id FROM listings WHERE address = ? AND size_m2 = ? AND id != ? AND extraction_done = 1 LIMIT 1
@@ -307,11 +296,10 @@ async function runExtractionStage(env, limit, successLogs) {
               extracted_data = ?, image_url = ?, raw_text = ?,
               address = ?, size_m2 = ?, total_cost_eur = ?,
               extraction_done = 1, jev_done = 0, jev_score = 0, jev_result = NULL,
-              updated_at = datetime('now')
-          WHERE id = ?
+              updated_at = datetime('now') WHERE id = ?
         `).bind(listing.title, listing.url, listing.willhaben_code || null,
           JSON.stringify(extraction), imageUrl, cleanText, address, sizeM2, totalCost, dup.id).run();
-        successLogs.push({ service: "workers-ai", url: WORKERS_AI_MODEL, message: `#${listing.id} → EDIT von #${dup.id}` });
+        successLogs.push({ service: "workers-ai", url: WORKERS_AI_MODEL, message: `#${listing.id} → EDIT` });
         continue;
       }
     }
@@ -322,13 +310,7 @@ async function runExtractionStage(env, limit, successLogs) {
       WHERE id = ?
     `).bind(JSON.stringify(extraction), imageUrl, cleanText, address, sizeM2, totalCost, listing.id).run();
 
-    // 🔧 Sammle Erfolgs-Log (nicht sofort einfügen)
-    successLogs.push({
-      service: "workers-ai",
-      url: WORKERS_AI_MODEL,
-      message: `#${listing.id}: ${address || '?'} (${totalCost || '?'} EUR)`
-    });
-
+    successLogs.push({ service: "workers-ai", url: WORKERS_AI_MODEL, message: `#${listing.id}: ${address || '?'} (${totalCost || '?'} EUR)` });
     await new Promise(r => setTimeout(r, 200));
   }
 }
@@ -693,7 +675,6 @@ async function handleGetLogs(env, url) {
   const limit = Math.min(100, parseInt(url.searchParams.get("limit") || "50"));
   const service = url.searchParams.get("service") || "";
   const status = url.searchParams.get("status") || "";
-
   let query = `SELECT id, service, url, status, error, response_snippet, created_at FROM request_logs WHERE created_at >= datetime('now', '-48 hours')`;
   const params = [];
   if (service) { query += ` AND service = ?`; params.push(service); }
@@ -701,7 +682,6 @@ async function handleGetLogs(env, url) {
   if (status === "error") query += ` AND status >= 400`;
   query += ` ORDER BY created_at DESC LIMIT ?`;
   params.push(limit);
-
   const { results } = await env.DB.prepare(query).bind(...params).all();
   return json({ logs: results });
 }
@@ -791,34 +771,13 @@ async function handleUpdateStatus(env, id, status) {
 }
 
 // ============================================================
-//  UI — Server-Side Rendering
+//  UI — Server-Side Rendering mit Tabs
 // ============================================================
 async function serveUI(env, url) {
-  const filter = url.searchParams.get("filter") || "approved";
-  const page = Math.max(1, parseInt(url.searchParams.get("page") || "1"));
-  const offset = (page - 1) * PER_PAGE;
+  const tab = url.searchParams.get("tab") || "listings";
 
-  // 🔧 WHERE-Clause basierend auf Filter
-  let whereClause = "";
-  if (filter === "approved") whereClause = "WHERE jev_done = 1 AND jev_score >= 0.7 AND status != 'archived' AND (jev_result IS NULL OR jev_result NOT LIKE '%\"rejected\":true%')";
-  else if (filter === "favorite") whereClause = "WHERE status = 'favorite'";
-  else if (filter === "archived") whereClause = "WHERE status = 'archived'";
-  else if (filter === "new") whereClause = "WHERE status = 'new' AND (jev_result IS NULL OR jev_result NOT LIKE '%\"rejected\":true%') AND extraction_done >= 0 AND jev_done >= 0";
-  else if (filter === "failed") whereClause = "WHERE extraction_done = -1 OR jev_done = -1";
-  else if (filter === "pending") whereClause = "WHERE (extraction_done = 0 OR jev_done = 0) AND extraction_done >= 0 AND jev_done >= 0";
-  else if (filter === "rejected") whereClause = "WHERE jev_result LIKE '%\"rejected\":true%'";
-
-  // 🔧 Alle Queries parallel
-  const [listingsRes, totalRes, stats, settings, tgUsers, quotaExhausted] = await Promise.all([
-    env.DB.prepare(`
-      SELECT id, willhaben_code, url, title, scraped_at, extracted_data, extraction_done,
-             jev_result, jev_score, jev_done, status, image_url,
-             address, size_m2, total_cost_eur
-      FROM listings ${whereClause}
-      ORDER BY jev_score DESC, scraped_at DESC
-      LIMIT ? OFFSET ?
-    `).bind(PER_PAGE, offset).all(),
-    env.DB.prepare(`SELECT COUNT(*) as cnt FROM listings ${whereClause}`).first(),
+  // 🔧 Parallel: Stats + Settings + Telegram-Users für Header
+  const [stats, settings, tgUsers, quotaExhausted] = await Promise.all([
     env.DB.prepare(`
       SELECT COUNT(*) as total,
         SUM(CASE WHEN status = 'favorite' THEN 1 ELSE 0 END) as favorites,
@@ -832,36 +791,12 @@ async function serveUI(env, url) {
     isAiQuotaExhausted(env),
   ]);
 
-  const listings = listingsRes.results || [];
-  const total = totalRes?.cnt || 0;
-  const totalPages = Math.max(1, Math.ceil(total / PER_PAGE));
-
-  // 🔧 Render Cards server-side
-  const cardsHtml = listings.length > 0 ? listings.map(l => renderCardServer(l)).join("") :
-    '<div class="empty"><div class="empty-icon">🏠</div><h2>Keine Anzeigen</h2></div>';
-
-  // 🔧 Pagination HTML
-  const paginationHtml = totalPages > 1 ? `
-    <div class="pagination">
-      ${page > 1 ? `<a href="/?filter=${filter}&page=${page - 1}" class="page-btn">◀ Zurück</a>` : `<span class="page-btn disabled">◀ Zurück</span>`}
-      <span class="info">Seite ${page} / ${totalPages} (${total} Anzeigen)</span>
-      ${page < totalPages ? `<a href="/?filter=${filter}&page=${page + 1}" class="page-btn">Weiter ▶</a>` : `<span class="page-btn disabled">Weiter ▶</span>`}
-    </div>
-  ` : "";
-
-  // 🔧 Filter Buttons
-  const filterBtns = [
-    ["approved", "✅ Bestätigt"],
-    ["all", "Alle"],
-    ["favorite", "⭐ Favoriten"],
-    ["new", "🆕 Neu"],
-    ["pending", "⏳ Wartend"],
-    ["archived", "📦 Archiv"],
-    ["rejected", "⛔ Abgelehnt"],
-    ["failed", "⚠️ Fehler"],
-  ].map(([key, label]) =>
-    `<a href="/?filter=${key}&page=1" class="filter-btn ${filter === key ? 'active' : ''}">${label}</a>`
-  ).join("");
+  // محتوای تب
+  let tabContent = "";
+  if (tab === "logs") tabContent = await renderLogsTab(env, url);
+  else if (tab === "telegram") tabContent = await renderTelegramTab(env);
+  else if (tab === "settings") tabContent = renderSettingsTab(settings);
+  else tabContent = await renderListingsTab(env, url);
 
   const html = `<!DOCTYPE html>
 <html lang="de">
@@ -882,7 +817,7 @@ async function serveUI(env, url) {
   .stat-label { opacity: 0.65; font-size: 9px; margin-top: 4px; text-transform: uppercase; }
   .tabs { background: rgba(255,255,255,0.92); backdrop-filter: saturate(180%) blur(20px); display: flex; border-bottom: 1px solid #e0e0e0; position: sticky; top: 0; z-index: 100; padding: 0 4px; overflow-x: auto; scrollbar-width: none; }
   .tabs::-webkit-scrollbar { display: none; }
-  .tab { flex: 1; padding: 14px 8px; border: none; background: none; cursor: pointer; font-size: 13px; font-weight: 600; color: #666; border-bottom: 3px solid transparent; min-height: 48px; white-space: nowrap; font-family: inherit; text-decoration: none; text-align: center; }
+  .tab { flex: 1; padding: 14px 8px; border: none; background: none; cursor: pointer; font-size: 13px; font-weight: 600; color: #666; border-bottom: 3px solid transparent; min-height: 48px; white-space: nowrap; font-family: inherit; text-decoration: none; text-align: center; display: flex; align-items: center; justify-content: center; }
   .tab.active { color: #0071e3; border-bottom-color: #0071e3; }
   .container { padding: 14px 12px; max-width: 1200px; margin: 0 auto; overflow-x: hidden; }
   .toolbar { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
@@ -953,9 +888,10 @@ async function serveUI(env, url) {
   .checkbox-item input { width: 22px; height: 22px; cursor: pointer; accent-color: #0071e3; }
   .save-btn { background: #0071e3; color: white; padding: 15px 24px; border: none; border-radius: 12px; font-size: 15px; font-weight: 700; cursor: pointer; width: 100%; min-height: 50px; font-family: inherit; }
   .success-msg { background: #d1f2d1; color: #1a7a1a; padding: 14px; border-radius: 12px; margin-bottom: 18px; display: none; font-size: 13.5px; font-weight: 600; text-align: center; }
-  .action-btn { padding: 10px 16px; border: 1px solid #d2d2d7; border-radius: 10px; background: white; cursor: pointer; font-size: 13px; font-weight: 600; min-height: 42px; font-family: inherit; }
+  .action-btn { padding: 10px 16px; border: 1px solid #d2d2d7; border-radius: 10px; background: white; cursor: pointer; font-size: 13px; font-weight: 600; min-height: 42px; font-family: inherit; text-decoration: none; display: inline-block; color: #1d1d1f; }
   .action-btn.danger { border-color: #ff3b30; color: #ff3b30; }
   .action-btn.success { border-color: #34c759; color: #34c759; }
+  .action-btn.active { background: #0071e3; color: white; border-color: #0071e3; }
   .info-box { background: #e3f2fd; border-radius: 12px; padding: 14px 16px; margin-bottom: 16px; font-size: 13px; }
   .user-card { background: white; border-radius: 12px; padding: 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
   .user-info { flex: 1; min-width: 200px; }
@@ -966,6 +902,7 @@ async function serveUI(env, url) {
   .status-bar.success { background: #d1f2d1; color: #1a7a1a; }
   .status-bar.error { background: #ffebee; color: #c62828; }
   .status-bar.info { background: #e3f2fd; color: #1565c0; }
+  .log-filters { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
   @media (min-width: 768px) {
     .header { padding: 18px 32px; display: flex; justify-content: space-between; align-items: center; gap: 16px; }
     .header h1 { font-size: 20px; margin-bottom: 0; }
@@ -1006,32 +943,15 @@ async function serveUI(env, url) {
 </div>
 
 <div class="tabs">
-  <a class="tab active" href="/">📋 Anzeigen</a>
-  <a class="tab" href="/?tab=logs">📊 Logs</a>
-  <a class="tab" href="/?tab=telegram">📱 Telegram</a>
-  <a class="tab" href="/?tab=settings">⚙️ Einstellungen</a>
+  <a class="tab ${tab === 'listings' ? 'active' : ''}" href="/">📋 Anzeigen</a>
+  <a class="tab ${tab === 'logs' ? 'active' : ''}" href="/?tab=logs">📊 Logs</a>
+  <a class="tab ${tab === 'telegram' ? 'active' : ''}" href="/?tab=telegram">📱 Telegram</a>
+  <a class="tab ${tab === 'settings' ? 'active' : ''}" href="/?tab=settings">⚙️ Einstellungen</a>
 </div>
 
 <div class="container">
-  ${quotaExhausted ? '<div class="quota-banner">⚠️ <strong>AI-Kontingent erschöpft</strong> — neue Anzeigen werden morgen verarbeitet.</div>' : ''}
-
-  <div class="toolbar">
-    <div class="toolbar-actions">
-      <button class="primary" onclick="forceRun()">⚡ Jetzt ausführen</button>
-      <button class="warning" onclick="retryAllFailed()">🔄 Alle Fehler erneut</button>
-      <button class="danger" onclick="resetAll()">🗑️ Löschen</button>
-    </div>
-  </div>
-
-  <div class="filter-scroll-wrapper">
-    <div class="filter-scroll-inner">${filterBtns}</div>
-  </div>
-
-  ${paginationHtml}
-
-  <div id="listings-container">${cardsHtml}</div>
-
-  ${paginationHtml}
+  ${quotaExhausted && tab === 'listings' ? '<div class="quota-banner">⚠️ <strong>AI-Kontingent erschöpft</strong></div>' : ''}
+  ${tabContent}
 </div>
 
 <script>
@@ -1055,10 +975,7 @@ async function retryAllFailed() {
   if (!confirm('Alle fehlgeschlagenen erneut verarbeiten?')) return;
   const res = await fetch(API_BASE + '/api/retry-all-failed', { method: 'POST' });
   const data = await res.json();
-  if (data.success) {
-    alert('✅ ' + data.changes + ' Anzeigen markiert.');
-    location.reload();
-  }
+  if (data.success) { alert('✅ ' + data.changes + ' Anzeigen markiert.'); location.reload(); }
 }
 async function forceRun() {
   if (!confirm('Cron jetzt starten?')) return;
@@ -1070,6 +987,39 @@ async function resetAll() {
   await fetch(API_BASE + '/api/reset-all');
   location.reload();
 }
+async function testAll() {
+  if (!confirm('Test-Nachricht an alle senden?')) return;
+  const res = await fetch(API_BASE + '/api/test-telegram');
+  const data = await res.json();
+  alert(data.success ? '✅ ' + data.sent + '/' + data.total : '❌ ' + (data.message || 'Fehler'));
+}
+async function blockUser(chatId) {
+  if (!confirm('Sperren?')) return;
+  await fetch(API_BASE + '/api/telegram-user/' + chatId + '/block', { method: 'POST' });
+  location.reload();
+}
+async function unblockUser(chatId) {
+  await fetch(API_BASE + '/api/telegram-user/' + chatId + '/unblock', { method: 'POST' });
+  location.reload();
+}
+async function testSingle(chatId) {
+  await fetch(API_BASE + '/api/telegram-user/' + chatId + '/test', { method: 'POST' });
+  alert('✅ OK');
+}
+async function saveSettings() {
+  const types = Array.from(document.querySelectorAll('.ptype:checked')).map(c => c.value);
+  const body = {
+    max_price: parseInt(document.getElementById('max_price').value),
+    target_city: document.getElementById('target_city').value,
+    allowed_property_types: types,
+  };
+  await fetch(API_BASE + '/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const msg = document.getElementById('settings-success');
+  msg.style.display = 'block';
+  setTimeout(() => msg.style.display = 'none', 3000);
+}
 </script>
 </body>
 </html>`;
@@ -1077,7 +1027,201 @@ async function resetAll() {
   return new Response(html, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
 }
 
-// 🔧 Server-Side Card Rendering
+// ============================================================
+//  Tab Renderers
+// ============================================================
+async function renderListingsTab(env, url) {
+  const filter = url.searchParams.get("filter") || "approved";
+  const page = Math.max(1, parseInt(url.searchParams.get("page") || "1"));
+  const offset = (page - 1) * PER_PAGE;
+
+  let whereClause = "";
+  if (filter === "approved") whereClause = "WHERE jev_done = 1 AND jev_score >= 0.7 AND status != 'archived' AND (jev_result IS NULL OR jev_result NOT LIKE '%\"rejected\":true%')";
+  else if (filter === "favorite") whereClause = "WHERE status = 'favorite'";
+  else if (filter === "archived") whereClause = "WHERE status = 'archived'";
+  else if (filter === "new") whereClause = "WHERE status = 'new' AND (jev_result IS NULL OR jev_result NOT LIKE '%\"rejected\":true%') AND extraction_done >= 0 AND jev_done >= 0";
+  else if (filter === "failed") whereClause = "WHERE extraction_done = -1 OR jev_done = -1";
+  else if (filter === "pending") whereClause = "WHERE (extraction_done = 0 OR jev_done = 0) AND extraction_done >= 0 AND jev_done >= 0";
+  else if (filter === "rejected") whereClause = "WHERE jev_result LIKE '%\"rejected\":true%'";
+
+  const [listingsRes, totalRes] = await Promise.all([
+    env.DB.prepare(`
+      SELECT id, willhaben_code, url, title, scraped_at, extracted_data, extraction_done,
+             jev_result, jev_score, jev_done, status, image_url,
+             address, size_m2, total_cost_eur
+      FROM listings ${whereClause}
+      ORDER BY jev_score DESC, scraped_at DESC
+      LIMIT ? OFFSET ?
+    `).bind(PER_PAGE, offset).all(),
+    env.DB.prepare(`SELECT COUNT(*) as cnt FROM listings ${whereClause}`).first(),
+  ]);
+
+  const listings = listingsRes.results || [];
+  const total = totalRes?.cnt || 0;
+  const totalPages = Math.max(1, Math.ceil(total / PER_PAGE));
+
+  const cardsHtml = listings.length > 0 ? listings.map(renderCardServer).join("") :
+    '<div class="empty"><div class="empty-icon">🏠</div><h2>Keine Anzeigen</h2></div>';
+
+  const paginationHtml = totalPages > 1 ? `
+    <div class="pagination">
+      ${page > 1 ? `<a href="/?filter=${filter}&page=${page - 1}" class="page-btn">◀ Zurück</a>` : `<span class="page-btn disabled">◀ Zurück</span>`}
+      <span class="info">Seite ${page} / ${totalPages} (${total})</span>
+      ${page < totalPages ? `<a href="/?filter=${filter}&page=${page + 1}" class="page-btn">Weiter ▶</a>` : `<span class="page-btn disabled">Weiter ▶</span>`}
+    </div>
+  ` : "";
+
+  const filterBtns = [
+    ["approved", "✅ Bestätigt"], ["all", "Alle"], ["favorite", "⭐ Favoriten"],
+    ["new", "🆕 Neu"], ["pending", "⏳ Wartend"], ["archived", "📦 Archiv"],
+    ["rejected", "⛔ Abgelehnt"], ["failed", "⚠️ Fehler"],
+  ].map(([key, label]) =>
+    `<a href="/?filter=${key}&page=1" class="filter-btn ${filter === key ? 'active' : ''}">${label}</a>`
+  ).join("");
+
+  return `
+    <div class="toolbar">
+      <div class="toolbar-actions">
+        <button class="primary" onclick="forceRun()">⚡ Jetzt ausführen</button>
+        <button class="warning" onclick="retryAllFailed()">🔄 Alle Fehler erneut</button>
+        <button class="danger" onclick="resetAll()">🗑️ Löschen</button>
+      </div>
+    </div>
+    <div class="filter-scroll-wrapper"><div class="filter-scroll-inner">${filterBtns}</div></div>
+    ${paginationHtml}
+    <div id="listings-container">${cardsHtml}</div>
+    ${paginationHtml}
+  `;
+}
+
+async function renderLogsTab(env, url) {
+  const service = url.searchParams.get("service") || "";
+  const statusFilter = url.searchParams.get("status") || "";
+
+  let query = `SELECT id, service, url, status, error, response_snippet, created_at FROM request_logs WHERE created_at >= datetime('now', '-48 hours')`;
+  const params = [];
+  if (service) { query += ` AND service = ?`; params.push(service); }
+  if (statusFilter === "success") query += ` AND status = 200`;
+  if (statusFilter === "error") query += ` AND status >= 400`;
+  query += ` ORDER BY created_at DESC LIMIT ?`;
+  params.push(LOGS_PER_PAGE);
+
+  const { results: logs } = await env.DB.prepare(query).bind(...params).all();
+
+  const filterLinks = [
+    ["", "", "🔄 Alle"],
+    ["service=willhaben", "", "📥 Willhaben"],
+    ["service=workers-ai", "", "🤖 Workers AI"],
+    ["service=jev", "", "⚖️ Jev"],
+    ["service=telegram", "", "📱 Telegram"],
+    ["status=success", "", "✅ Erfolge"],
+    ["status=error", "", "❌ Fehler"],
+  ].map(([q, _, label]) => {
+    const isActive =
+      (q === "" && !service && !statusFilter) ||
+      (q.startsWith("service=") && service === q.split("=")[1]) ||
+      (q === "status=success" && statusFilter === "success") ||
+      (q === "status=error" && statusFilter === "error");
+    return `<a href="/?tab=logs${q ? '&' + q : ''}" class="action-btn ${isActive ? 'active' : ''}">${label}</a>`;
+  }).join(" ");
+
+  let logsHtml = '';
+  if (!logs || logs.length === 0) {
+    logsHtml = '<div class="empty"><div class="empty-icon">📋</div><h2>Keine Logs</h2></div>';
+  } else {
+    logsHtml = logs.map(log => {
+      const ok = log.status >= 200 && log.status < 300;
+      const statusCls = ok ? 'log-status-ok' : 'log-status-err';
+      const snip = log.error || log.response_snippet || '–';
+      return '<div class="log-card">'
+        + '<div class="log-card-header">'
+        + '<span class="log-card-time">' + escHtml(log.created_at || '') + '</span>'
+        + '<div style="display:flex;gap:6px;">'
+        + '<span class="log-service ' + escHtml(log.service || '') + '">' + escHtml(log.service || '') + '</span>'
+        + '<span class="' + statusCls + '">' + (log.status || '?') + '</span>'
+        + '</div></div>'
+        + '<div><div class="log-row"><div class="log-label">Info</div><div class="log-value">' + escHtml(snip.substring(0, 250)) + '</div></div>'
+        + (log.url && log.url !== log.service ? '<div class="log-row"><div class="log-label">URL</div><div class="log-value">' + escHtml(log.url.substring(0, 100)) + '</div></div>' : '')
+        + '</div></div>';
+    }).join('');
+  }
+
+  return `
+    <div class="log-filters">${filterLinks}</div>
+    <div>${logsHtml}</div>
+  `;
+}
+
+async function renderTelegramTab(env) {
+  const { results: users } = await env.DB.prepare(`
+    SELECT chat_id, username, first_name, subscribed_at, last_seen, is_active, is_blocked, notifications_sent
+    FROM telegram_users ORDER BY subscribed_at DESC
+  `).all();
+
+  let usersHtml = '';
+  if (!users || users.length === 0) {
+    usersHtml = '<div class="empty"><div class="empty-icon">👥</div><h2>Keine Nutzer</h2><p>Sende /start an den Bot.</p></div>';
+  } else {
+    usersHtml = '<h3 style="margin:14px 0 10px;font-size:14px;">👥 ' + users.length + ' Nutzer</h3>';
+    for (const u of users) {
+      const blocked = u.is_blocked === 1;
+      const active = u.is_active === 1;
+      let statusBadge = blocked ? '<span class="badge badge-blocked">🚫 Blockiert</span>'
+        : (active ? '<span class="badge badge-match">✓ Aktiv</span>'
+        : '<span class="badge badge-archived">⏸ Inaktiv</span>');
+
+      usersHtml += '<div class="user-card">'
+        + '<div class="user-info"><strong>' + escHtml(u.first_name || 'Anonym') + (u.username ? ' (@' + escHtml(u.username) + ')' : '') + '</strong>'
+        + '<span class="sub">' + statusBadge + ' · ' + (u.notifications_sent || 0) + ' Nachrichten</span></div>'
+        + '<div class="user-actions">'
+        + (blocked
+            ? '<button class="action-btn success" onclick="unblockUser(&apos;' + u.chat_id + '&apos;)">✅ Entsperren</button>'
+            : '<button class="action-btn danger" onclick="blockUser(&apos;' + u.chat_id + '&apos;)">🚫 Sperren</button>')
+        + '<button class="action-btn" onclick="testSingle(&apos;' + u.chat_id + '&apos;)">📤 Test</button>'
+        + '</div></div>';
+    }
+  }
+
+  return `
+    <div class="info-box"><strong>📱 Telegram Bot</strong><br>Nutzer: <strong>${users.length}</strong></div>
+    <div style="margin-bottom:16px;">
+      <button class="action-btn" onclick="testAll()">📤 Test an alle</button>
+    </div>
+    <div>${usersHtml}</div>
+  `;
+}
+
+function renderSettingsTab(settings) {
+  const types = settings.allowed_property_types || [];
+  return `
+    <div class="settings-form">
+      <div class="success-msg" id="settings-success">✅ Gespeichert!</div>
+      <h2>⚙️ Filter</h2>
+      <div class="form-group">
+        <label>💰 Max. Preis (EUR)</label>
+        <input type="number" id="max_price" value="${settings.max_price || 550}" inputmode="numeric">
+      </div>
+      <div class="form-group">
+        <label>🏙️ Stadt</label>
+        <input type="text" id="target_city" value="${escHtml(settings.target_city || 'Wien')}">
+      </div>
+      <div class="form-group">
+        <label>🏠 Erlaubte Typen</label>
+        <div class="checkbox-group">
+          <label class="checkbox-item"><input type="checkbox" class="ptype" value="apartment" ${types.includes('apartment') ? 'checked' : ''}> <span>Wohnung</span></label>
+          <label class="checkbox-item"><input type="checkbox" class="ptype" value="wg_room" ${types.includes('wg_room') ? 'checked' : ''}> <span>WG-Zimmer</span></label>
+          <label class="checkbox-item"><input type="checkbox" class="ptype" value="studio" ${types.includes('studio') ? 'checked' : ''}> <span>Studio</span></label>
+          <label class="checkbox-item"><input type="checkbox" class="ptype" value="other" ${types.includes('other') ? 'checked' : ''}> <span>Sonstiges</span></label>
+        </div>
+      </div>
+      <button class="save-btn" onclick="saveSettings()">💾 Speichern</button>
+    </div>
+  `;
+}
+
+// ============================================================
+//  Card Renderer
+// ============================================================
 function renderCardServer(l) {
   let extracted = {};
   try { extracted = l.extracted_data ? JSON.parse(l.extracted_data) : {}; } catch {}
@@ -1090,6 +1234,7 @@ function renderCardServer(l) {
   const isExtractionFailed = l.extraction_done === -1;
   const isJevFailed = l.jev_done === -1;
   const isJevPending = l.extraction_done === 1 && l.jev_done === 0;
+  const isFailed = isExtractionFailed || isJevFailed;
 
   let badge = '<span class="badge badge-pending">⏳ Wartend</span>';
   if (isExtractionFailed) badge = '<span class="badge badge-error">⚠️ Extraction-Fehler</span>';
@@ -1113,12 +1258,8 @@ function renderCardServer(l) {
     ? '<img class="card-image" src="' + escHtml(l.image_url) + '" loading="lazy" referrerpolicy="no-referrer" onerror="this.outerHTML=\'&lt;div class=&quot;card-image card-image-placeholder&quot;&gt;🏠&lt;/div&gt;\'">'
     : '<div class="card-image card-image-placeholder">🏠</div>';
 
-  const isFailed = isExtractionFailed || isJevFailed;
   const favLabel = l.status === 'favorite' ? '⭐ Weg' : '⭐ Fav';
   const archLabel = l.status === 'archived' ? '📤' : '📦';
-  const retryBtn = isFailed
-    ? '<button class="retry" onclick="retryListing(' + l.id + ')">🔄</button>'
-    : '<button onclick="toggleFavorite(' + l.id + ',\'' + l.status + '\')">' + favLabel + '</button>';
 
   return '<div class="card" data-status="' + l.status + '" data-id="' + l.id + '">'
     + imageBlock
@@ -1132,9 +1273,11 @@ function renderCardServer(l) {
     + '</div>'
     + '<div class="card-actions">'
     + '<a href="' + escHtml(l.url) + '" target="_blank" rel="noopener">🔗</a>'
-    + (isFailed ? retryBtn : '<button onclick="toggleFavorite(' + l.id + ',\'' + l.status + '\')">' + favLabel + '</button>')
+    + (isFailed
+        ? '<button class="retry" onclick="retryListing(' + l.id + ')">🔄 Retry</button>'
+        : '<button onclick="toggleFavorite(' + l.id + ',\'' + l.status + '\')">' + favLabel + '</button>')
     + '<button onclick="toggleArchive(' + l.id + ',\'' + l.status + '\')">' + archLabel + '</button>'
-    + (isFailed ? '' : '')
+    + (isFailed ? '<span></span>' : '<span></span>')
     + '</div>'
     + '</div>';
 }
