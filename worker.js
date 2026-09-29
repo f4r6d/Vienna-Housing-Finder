@@ -598,7 +598,7 @@ async function sendTelegramMessage(env, chatId, text, extra = {}) {
 
 async function sendTelegramWithKeyboard(env, chatId, text) {
   return sendTelegramMessage(env, chatId, text, {
-    reply_markup: { keyboard: [[{ text: "⏸ Stop" }, { text: "▶️ Start" }], [{ text: "📊 Status" }]], resize_keyboard: true }
+    reply_markup: { keyboard: [[{ text: "⏸ Stop" }, { text: "▶️ Start" }], [{ text: "📊 Status" }]], resize_keyboard: true, one_time_keyboard: true }
   });
 }
 
