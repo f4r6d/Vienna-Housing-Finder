@@ -641,7 +641,7 @@ If listings get stuck with `extraction_done = -1` or `jev_done = -1`:
 
 ## 🌐 Web Dashboard
 
-Accessible at `https://vienna-housing.lizadferi3.workers.dev/`.
+Accessible at [https://vienna-housing.lizadferi3.workers.dev/](https://vienna-housing.lizadferi3.workers.dev/).
 
 ### Tabs
 
