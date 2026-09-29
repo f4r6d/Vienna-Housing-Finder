@@ -1,0 +1,50 @@
+{
+  "name": "vienna-housing",
+  "version": "1.0.0",
+  "description": "Automated Willhaben.at scraper with Workers AI evaluation, Jev scoring, and Telegram notifications. Runs entirely on Cloudflare Workers + D1.",
+  "main": "src/index.js",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "db:create": "wrangler d1 create vienna-housing-db",
+    "db:init": "wrangler d1 execute vienna-housing-db --remote --file=./schema.sql",
+    "db:init:local": "wrangler d1 execute vienna-housing-db --local --file=./schema.sql",
+    "secrets:set": "wrangler secret put TELEGRAM_BOT_TOKEN && wrangler secret put TYPESAFE_API_KEY",
+    "secrets:list": "wrangler secret list",
+    "logs": "wrangler tail --format pretty"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "cloudflare-d1",
+    "workers-ai",
+    "willhaben",
+    "housing",
+    "scraper",
+    "telegram-bot",
+    "vienna",
+    "wien",
+    "real-estate",
+    "typesafe",
+    "jev",
+    "serverless"
+  ],
+  "author": "Farshid",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/vienna-housing.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YOUR_USERNAME/vienna-housing/issues"
+  },
+  "homepage": "https://github.com/YOUR_USERNAME/vienna-housing#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.78.0"
+  }
+}
