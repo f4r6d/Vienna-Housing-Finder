@@ -1,1 +1,47 @@
 
+# Development files
+src/
+.wrangler/
+.dev.vars
+.env
+.env.example
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+schema.sql
+
+# Cloudflare config
+wrangler.toml
+
+# Documentation
+docs/
+examples/
+CONTRIBUTING.md
+CHANGELOG.md
+
+# IDE
+.idea/
+.vscode/
+.editorconfig
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests
+tests/
+coverage/
+
+# Git
+.git/
+.gitignore
+
+# Build artifacts
+dist/
+build/
+*.log
+
+# CI/CD
+.github/
