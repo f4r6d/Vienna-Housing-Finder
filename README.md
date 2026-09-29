@@ -52,6 +52,12 @@ The entire application runs on Cloudflare's free tier (with quota limitations ex
 
 ---
 
+## 📸 Screenshots
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+---
+
 ## ✨ Key Features
 
 | Feature | Description |
