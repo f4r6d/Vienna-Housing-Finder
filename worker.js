@@ -61,7 +61,7 @@ export default {
 };
 
 // ============================================================
-//  Mutex Lock — verhindert überlappende Cron-Runs
+//  Mutex Lock — mit korrekter Datums-Parsing
 // ============================================================
 async function acquireCronLock(env) {
   try {
@@ -70,9 +70,11 @@ async function acquireCronLock(env) {
     ).first();
 
     if (row && row.value === '1') {
-      // Prüfen, ob der alte Lock abgelaufen ist
-      const updatedAt = row.updated_at ? new Date(row.updated_at + 'Z').getTime() : 0;
-      const age = Date.now() - updatedAt;
+      // 🔧 Korrekte Parsing: "2026-09-29 08:54:13" → "2026-09-29T08:54:13Z"
+      const updatedAt = row.updated_at 
+        ? new Date(row.updated_at.replace(' ', 'T') + 'Z').getTime() 
+        : 0;
+      const age = Number.isNaN(updatedAt) ? 0 : Date.now() - updatedAt;
 
       if (age < CRON_LOCK_TIMEOUT_MS) {
         console.log(`⏭️ Cron läuft bereits (Alter: ${Math.round(age / 1000)}s) — überspringe`);
@@ -89,7 +91,7 @@ async function acquireCronLock(env) {
     return true;
   } catch (err) {
     console.error("Lock-Fehler:", err);
-    return true; // Im Zweifelsfall fortfahren
+    return true;
   }
 }
 
@@ -162,7 +164,10 @@ async function handleCron(env) {
     const cleanupRow = await env.DB.prepare(
       `SELECT updated_at FROM system_state WHERE key = 'last_cleanup'`
     ).first();
-    const lastCleanup = cleanupRow?.updated_at ? new Date(cleanupRow.updated_at + 'Z').getTime() : 0;
+    const lastCleanup = cleanupRow?.updated_at 
+      ? new Date(cleanupRow.updated_at.replace(' ', 'T') + 'Z').getTime() 
+      : 0;
+    const lastCleanupSafe = Number.isNaN(lastCleanup) ? 0 : lastCleanup;
     if (Date.now() - lastCleanup > 600000) {
       await env.DB.prepare(`DELETE FROM request_logs WHERE created_at < datetime('now', '-2 days')`).run();
       await env.DB.prepare(`
