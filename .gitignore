@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Cloudflare
+.wrangler/
+dist/
+
+# Environment and Secrets
+.env
+.dev.vars
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+*.log
