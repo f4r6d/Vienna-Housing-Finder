@@ -1,16 +1,61 @@
-# Dependencies
+# ─── Dependencies ──────────────────────────────────────────────
 node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
 
-# Cloudflare
+# ─── Cloudflare Wrangler ───────────────────────────────────────
 .wrangler/
 dist/
+build/
 
-# Environment and Secrets
+# ─── Environment Variables & Secrets ───────────────────────────
 .env
+.env.local
+.env.*.local
 .dev.vars
+*.env
 
-# IDE and OS files
-.idea/
-.vscode/
-.DS_Store
+# ─── Logs ──────────────────────────────────────────────────────
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.log.*
+
+# ─── IDE & Editor ──────────────────────────────────────────────
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# ─── OS Files ──────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# ─── Local Databases & Backups ─────────────────────────────────
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.backup
+
+# ─── Testing & Coverage ────────────────────────────────────────
+coverage/
+.nyc_output/
+*.lcov
+
+# ─── Temporary Files ───────────────────────────────────────────
+tmp/
+temp/
+*.tmp
+*.bak
