@@ -1,6 +1,6 @@
 // ============================================================
-//  Willhaben Wien Finder — Version 21.0
-//  Fixed: Working Tabs (Logs, Telegram, Settings)
+//  Willhaben Wien Finder — Version 24.0
+//  Filter counts, reordered filters, spacing, merged rejected
 // ============================================================
 
 const WORKERS_AI_MODEL = "@cf/qwen/qwen3.8-27b";
@@ -81,6 +81,30 @@ async function releaseCronLock(env) {
 }
 
 // ============================================================
+//  Stats Cache (with filter counts)
+// ============================================================
+async function refreshStatsCache(env) {
+  try {
+    const freshStats = await env.DB.prepare(`
+      SELECT 
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'favorite' THEN 1 ELSE 0 END) as favorites,
+        SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) as archived,
+        SUM(CASE WHEN extraction_done = -1 OR jev_done = -1 THEN 1 ELSE 0 END) as failed,
+        SUM(CASE WHEN (extraction_done = 0 OR jev_done = 0) AND extraction_done >= 0 AND jev_done >= 0 THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'new' AND jev_done = 1 AND jev_score >= 0.7 THEN 1 ELSE 0 END) as new_count,
+        SUM(CASE WHEN jev_done = 1 AND jev_score >= 0.7 AND status != 'archived' AND (jev_result IS NULL OR jev_result NOT LIKE '%"rejected":true%') THEN 1 ELSE 0 END) as approved
+      FROM listings
+    `).first();
+    
+    await env.DB.prepare(`
+      INSERT INTO system_state (key, value, updated_at) VALUES ('cached_stats', ?, datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+    `).bind(JSON.stringify(freshStats)).run();
+  } catch (e) { console.error("Stats cache refresh error:", e); }
+}
+
+// ============================================================
 //  Quota
 // ============================================================
 async function isAiQuotaExhausted(env) {
@@ -155,6 +179,9 @@ async function handleCron(env) {
       await env.DB.batch(batch);
       console.log(`   📝 ${successLogs.length} Success-Logs`);
     }
+
+    // Refresh stats cache
+    await refreshStatsCache(env);
 
     console.log(`✅ Cron abgeschlossen in ${Date.now() - startTime}ms`);
   } catch (err) {
@@ -251,6 +278,8 @@ async function runExtractionStage(env, limit, successLogs) {
 
   if (results.length === 0) return;
 
+  const dbUpdates = [];
+
   for (const listing of results) {
     let html = null, status = 0;
     try {
@@ -265,7 +294,7 @@ async function runExtractionStage(env, limit, successLogs) {
     } catch {}
 
     if (!html || status !== 200) {
-      await env.DB.prepare(`UPDATE listings SET extraction_done = -1 WHERE id = ?`).bind(listing.id).run();
+      dbUpdates.push(env.DB.prepare(`UPDATE listings SET extraction_done = -1 WHERE id = ?`).bind(listing.id));
       continue;
     }
 
@@ -277,7 +306,7 @@ async function runExtractionStage(env, limit, successLogs) {
     const extraction = await callWorkersAI(env, cleanText, listing.title);
 
     if (!extraction) {
-      await env.DB.prepare(`UPDATE listings SET extraction_done = -1, image_url = ? WHERE id = ?`).bind(imageUrl, listing.id).run();
+      dbUpdates.push(env.DB.prepare(`UPDATE listings SET extraction_done = -1, image_url = ? WHERE id = ?`).bind(imageUrl, listing.id));
       continue;
     }
 
@@ -289,29 +318,35 @@ async function runExtractionStage(env, limit, successLogs) {
       const dup = await env.DB.prepare(`
         SELECT id FROM listings WHERE address = ? AND size_m2 = ? AND id != ? AND extraction_done = 1 LIMIT 1
       `).bind(address, sizeM2, listing.id).first();
+      
       if (dup) {
         await env.DB.prepare(`DELETE FROM listings WHERE id = ?`).bind(listing.id).run();
-        await env.DB.prepare(`
+        dbUpdates.push(env.DB.prepare(`
           UPDATE listings SET title = ?, url = ?, willhaben_code = ?,
               extracted_data = ?, image_url = ?, raw_text = ?,
               address = ?, size_m2 = ?, total_cost_eur = ?,
               extraction_done = 1, jev_done = 0, jev_score = 0, jev_result = NULL,
               updated_at = datetime('now') WHERE id = ?
         `).bind(listing.title, listing.url, listing.willhaben_code || null,
-          JSON.stringify(extraction), imageUrl, cleanText, address, sizeM2, totalCost, dup.id).run();
+          JSON.stringify(extraction), imageUrl, cleanText, address, sizeM2, totalCost, dup.id));
         successLogs.push({ service: "workers-ai", url: WORKERS_AI_MODEL, message: `#${listing.id} → EDIT` });
         continue;
       }
     }
 
-    await env.DB.prepare(`
+    dbUpdates.push(env.DB.prepare(`
       UPDATE listings SET extracted_data = ?, extraction_done = 1, image_url = ?, raw_text = ?,
           address = ?, size_m2 = ?, total_cost_eur = ?, updated_at = datetime('now')
       WHERE id = ?
-    `).bind(JSON.stringify(extraction), imageUrl, cleanText, address, sizeM2, totalCost, listing.id).run();
+    `).bind(JSON.stringify(extraction), imageUrl, cleanText, address, sizeM2, totalCost, listing.id));
 
     successLogs.push({ service: "workers-ai", url: WORKERS_AI_MODEL, message: `#${listing.id}: ${address || '?'} (${totalCost || '?'} EUR)` });
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  if (dbUpdates.length > 0) {
+    try { await env.DB.batch(dbUpdates); } 
+    catch (e) { console.error("Extraction batch error:", e); }
   }
 }
 
@@ -399,6 +434,9 @@ async function runJevStage(env, settings, limit, successLogs) {
 
   if (results.length === 0) return;
 
+  const dbUpdates = [];
+  const telegramQueue = [];
+
   for (const listing of results) {
     let extracted = {};
     try { extracted = JSON.parse(listing.extracted_data); } catch {}
@@ -430,21 +468,24 @@ async function runJevStage(env, settings, limit, successLogs) {
       if (foundKeywords.length > 0) reasons.push(`Keywords: ${foundKeywords.join(", ")}`);
       if (rejectWg) reasons.push("WG");
       if (isReserved) reasons.push("Reserviert");
-      await env.DB.prepare(`
+      
+      dbUpdates.push(env.DB.prepare(`
         UPDATE listings SET jev_result = ?, jev_score = 0, jev_done = 1,
           status = CASE WHEN status = 'new' THEN 'archived' ELSE status END,
           updated_at = datetime('now') WHERE id = ?
-      `).bind(JSON.stringify({ rejected: true, reason: reasons.join(" | ") }), listing.id).run();
+      `).bind(JSON.stringify({ rejected: true, reason: reasons.join(" | ") }), listing.id));
+      
       successLogs.push({ service: "jev", url: JEV_MODEL, message: `#${listing.id}: REJECTED — ${reasons.join(" | ").substring(0, 80)}` });
       continue;
     }
 
     if (extracted.property_type && !allowedTypes.includes(extracted.property_type) && extracted.property_type !== 'other') {
-      await env.DB.prepare(`
+      dbUpdates.push(env.DB.prepare(`
         UPDATE listings SET jev_result = ?, jev_score = 0, jev_done = 1,
           status = CASE WHEN status = 'new' THEN 'archived' ELSE status END,
           updated_at = datetime('now') WHERE id = ?
-      `).bind(JSON.stringify({ rejected: true, reason: `Typ "${extracted.property_type}"` }), listing.id).run();
+      `).bind(JSON.stringify({ rejected: true, reason: `Typ "${extracted.property_type}"` }), listing.id));
+      
       successLogs.push({ service: "jev", url: JEV_MODEL, message: `#${listing.id}: REJECTED — Typ ${extracted.property_type}` });
       continue;
     }
@@ -466,22 +507,34 @@ ${(extracted.description || "Keine Beschreibung").substring(0, 1000)}`;
 
     if (jevResult) {
       const score = calculateScore(jevResult, settings);
-      await env.DB.prepare(`
-        UPDATE listings SET jev_result = ?, jev_score = ?, jev_done = 1, updated_at = datetime('now')
-        WHERE id = ?
-      `).bind(JSON.stringify(jevResult), score, listing.id).run();
+      const shouldArchive = score < NOTIFICATION_THRESHOLD;
+      
+      dbUpdates.push(env.DB.prepare(`
+        UPDATE listings SET jev_result = ?, jev_score = ?, jev_done = 1,
+          status = CASE WHEN ? = 1 AND status = 'new' THEN 'archived' ELSE status END,
+          updated_at = datetime('now') WHERE id = ?
+      `).bind(JSON.stringify(jevResult), score, shouldArchive ? 1 : 0, listing.id));
 
       const verdict = score >= NOTIFICATION_THRESHOLD ? "APPROVED" : "Low";
       successLogs.push({ service: "jev", url: JEV_MODEL, message: `#${listing.id}: ${verdict} — Score ${(score * 100).toFixed(0)}%` });
 
       if (score >= NOTIFICATION_THRESHOLD) {
-        try { await notifyTelegram(env, { ...listing, jev_score: score, extracted }); } catch {}
+        telegramQueue.push({ ...listing, jev_score: score, extracted });
       }
     } else {
-      await env.DB.prepare(`UPDATE listings SET jev_done = -1 WHERE id = ?`).bind(listing.id).run();
+      dbUpdates.push(env.DB.prepare(`UPDATE listings SET jev_done = -1 WHERE id = ?`).bind(listing.id));
     }
 
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  if (dbUpdates.length > 0) {
+    try { await env.DB.batch(dbUpdates); } 
+    catch (e) { console.error("Jev batch error:", e); }
+  }
+
+  for (const l of telegramQueue) {
+    try { await notifyTelegram(env, l); } catch {}
   }
 }
 
@@ -659,16 +712,14 @@ function buildUrl(base, page) {
 //  API Handlers
 // ============================================================
 async function handleGetStats(env) {
-  const stats = await env.DB.prepare(`
-    SELECT COUNT(*) as total,
-      SUM(CASE WHEN status = 'favorite' THEN 1 ELSE 0 END) as favorites,
-      SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) as archived,
-      SUM(CASE WHEN extraction_done = -1 OR jev_done = -1 THEN 1 ELSE 0 END) as failed,
-      SUM(CASE WHEN (extraction_done = 0 OR jev_done = 0) AND extraction_done >= 0 AND jev_done >= 0 THEN 1 ELSE 0 END) as pending
-    FROM listings
-  `).first();
-  const quotaExhausted = await isAiQuotaExhausted(env);
-  return json({ stats, ai_quota_exhausted: quotaExhausted });
+  try {
+    const row = await env.DB.prepare(`SELECT value FROM system_state WHERE key = 'cached_stats'`).first();
+    const stats = (row && row.value) ? JSON.parse(row.value) : { total: 0, favorites: 0, archived: 0, failed: 0, pending: 0, new_count: 0, approved: 0 };
+    const quotaExhausted = await isAiQuotaExhausted(env);
+    return json({ stats, ai_quota_exhausted: quotaExhausted });
+  } catch (e) {
+    return json({ stats: { total: 0, favorites: 0, archived: 0, failed: 0, pending: 0, new_count: 0, approved: 0 }, error: e.toString() }, 500);
+  }
 }
 
 async function handleGetLogs(env, url) {
@@ -741,6 +792,7 @@ async function handleResetAll(env) {
   await env.DB.prepare(`DELETE FROM request_logs`).run();
   await env.DB.prepare(`DELETE FROM notified_listings`).run();
   await clearAiQuotaExhausted(env);
+  await refreshStatsCache(env);
   return json({ success: true });
 }
 
@@ -751,6 +803,7 @@ async function handleRetry(env, id) {
         status = CASE WHEN status IN ('archived') THEN 'new' ELSE status END,
         updated_at = datetime('now') WHERE id = ?
   `).bind(id).run();
+  await refreshStatsCache(env);
   return json({ success: true, id });
 }
 
@@ -762,41 +815,56 @@ async function handleRetryAllFailed(env) {
         status = CASE WHEN status IN ('archived') THEN 'new' ELSE status END,
         updated_at = datetime('now') WHERE extraction_done = -1 OR jev_done = -1
   `).run();
+  await refreshStatsCache(env);
   return json({ success: true, changes: result.meta?.changes || 0 });
 }
 
 async function handleUpdateStatus(env, id, status) {
   await env.DB.prepare(`UPDATE listings SET status = ?, updated_at = datetime('now') WHERE id = ?`).bind(status, id).run();
+  await refreshStatsCache(env);
   return json({ success: true });
 }
 
 // ============================================================
-//  UI — Server-Side Rendering mit Tabs
+//  UI — Server-Side Rendering
 // ============================================================
 async function serveUI(env, url) {
   const tab = url.searchParams.get("tab") || "listings";
 
-  // 🔧 Parallel: Stats + Settings + Telegram-Users für Header
-  const [stats, settings, tgUsers, quotaExhausted] = await Promise.all([
-    env.DB.prepare(`
-      SELECT COUNT(*) as total,
-        SUM(CASE WHEN status = 'favorite' THEN 1 ELSE 0 END) as favorites,
-        SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) as archived,
-        SUM(CASE WHEN extraction_done = -1 OR jev_done = -1 THEN 1 ELSE 0 END) as failed,
-        SUM(CASE WHEN (extraction_done = 0 OR jev_done = 0) AND extraction_done >= 0 AND jev_done >= 0 THEN 1 ELSE 0 END) as pending
-      FROM listings
-    `).first(),
-    loadSettings(env),
-    env.DB.prepare(`SELECT COUNT(*) as count FROM telegram_users WHERE is_active = 1 AND is_blocked = 0`).first(),
-    isAiQuotaExhausted(env),
-  ]);
+  // Read stats from cache
+  let stats = { total: 0, favorites: 0, archived: 0, pending: 0, failed: 0, new_count: 0, approved: 0 };
+  let quotaExhausted = false;
+  
+  try {
+    const [statsRow, quotaRes] = await Promise.all([
+      env.DB.prepare(`SELECT value FROM system_state WHERE key = 'cached_stats'`).first(),
+      isAiQuotaExhausted(env),
+    ]);
+    if (statsRow && statsRow.value) {
+      try { stats = JSON.parse(statsRow.value); } catch {}
+    }
+    quotaExhausted = quotaRes;
+  } catch (e) {
+    console.error("Stats cache read error:", e);
+  }
 
-  // محتوای تب
+  // Render tab content
   let tabContent = "";
-  if (tab === "logs") tabContent = await renderLogsTab(env, url);
-  else if (tab === "telegram") tabContent = await renderTelegramTab(env);
-  else if (tab === "settings") tabContent = renderSettingsTab(settings);
-  else tabContent = await renderListingsTab(env, url);
+  try {
+    if (tab === "logs") {
+      tabContent = await renderLogsTab(env, url);
+    } else if (tab === "telegram") {
+      tabContent = await renderTelegramTab(env);
+    } else if (tab === "settings") {
+      const settings = await loadSettings(env);
+      tabContent = renderSettingsTab(settings);
+    } else {
+      tabContent = await renderListingsTab(env, url, stats);
+    }
+  } catch (e) {
+    console.error(`Tab-Fehler (${tab}):`, e);
+    tabContent = '<div class="empty"><div class="empty-icon">❌</div><h2>Fehler beim Laden</h2></div>';
+  }
 
   const html = `<!DOCTYPE html>
 <html lang="de">
@@ -827,11 +895,51 @@ async function serveUI(env, url) {
   .toolbar button.danger { border-color: #ff3b30; color: #ff3b30; }
   .toolbar button.warning { border-color: #ff9500; color: #ff9500; }
   .toolbar button.primary { background: #34c759; color: white; border-color: #34c759; font-size: 15px; font-weight: 700; }
-  .filter-scroll-wrapper { width: 100%; max-width: 100%; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; margin: 0 -12px; padding: 4px 12px 10px; }
+  /* Filter scroll wrapper with margin-bottom for spacing */
+  .filter-scroll-wrapper { 
+    width: 100%; 
+    max-width: 100%; 
+    overflow-x: auto; 
+    overflow-y: hidden; 
+    -webkit-overflow-scrolling: touch; 
+    scrollbar-width: none; 
+    margin: 0 -12px 16px -12px; 
+    padding: 4px 12px 10px; 
+  }
   .filter-scroll-wrapper::-webkit-scrollbar { display: none; }
   .filter-scroll-inner { display: inline-flex; gap: 6px; white-space: nowrap; }
-  .filter-btn { display: inline-block; padding: 8px 14px; border: 1px solid #d2d2d7; border-radius: 20px; background: white; cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap; flex-shrink: 0; color: #1d1d1f; font-family: inherit; min-height: 36px; user-select: none; text-decoration: none; line-height: 1.4; }
+  .filter-btn { 
+    display: inline-flex; 
+    align-items: center; 
+    padding: 9px 14px; 
+    border: 1px solid #d2d2d7; 
+    border-radius: 20px; 
+    background: white; 
+    cursor: pointer; 
+    font-size: 13px; 
+    font-weight: 600; 
+    white-space: nowrap; 
+    flex-shrink: 0; 
+    color: #1d1d1f; 
+    font-family: inherit; 
+    min-height: 38px; 
+    user-select: none; 
+    text-decoration: none; 
+    line-height: 1.4; 
+  }
   .filter-btn.active { background: #0071e3; color: white; border-color: #0071e3; font-weight: 700; }
+  .filter-count {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 8px;
+    border-radius: 10px;
+    background: rgba(0,0,0,0.08);
+    font-size: 11px;
+    font-weight: 700;
+    min-width: 20px;
+    text-align: center;
+  }
+  .filter-btn.active .filter-count { background: rgba(255,255,255,0.25); color: white; }
   .quota-banner { padding: 12px 16px; background: #fff3cd; border-radius: 12px; margin-bottom: 14px; font-size: 13px; color: #856404; border: 1px solid #ffc107; }
   .pagination { display: flex; justify-content: space-between; align-items: center; margin: 12px 0; padding: 12px; background: white; border-radius: 12px; }
   .page-btn { padding: 10px 16px; border: 1px solid #d2d2d7; border-radius: 10px; background: white; cursor: pointer; font-size: 13px; font-weight: 600; font-family: inherit; text-decoration: none; color: #1d1d1f; display: inline-block; }
@@ -857,7 +965,8 @@ async function serveUI(env, url) {
   .card-score { font-size: 11.5px; color: #666; font-weight: 600; }
   .score-bar { height: 4px; background: #e0e0e0; border-radius: 3px; margin-top: 6px; overflow: hidden; }
   .score-fill { height: 100%; border-radius: 3px; }
-  .card-actions { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px; }
+  /* Card actions: 3 columns (not 4) */
+  .card-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
   .card-actions button, .card-actions a { padding: 11px 6px; border: 1px solid #d2d2d7; border-radius: 10px; background: white; cursor: pointer; font-size: 12px; font-weight: 600; min-height: 44px; display: flex; align-items: center; justify-content: center; text-decoration: none; color: #1d1d1f; font-family: inherit; }
   .card-actions a { color: #0071e3; border-color: #0071e3; }
   .card-actions button.retry { color: #ff9500; border-color: #ff9500; }
@@ -914,7 +1023,7 @@ async function serveUI(env, url) {
     .toolbar { flex-direction: row; align-items: center; }
     .toolbar-actions { display: flex; gap: 10px; }
     .toolbar-actions .primary { grid-column: auto; padding: 10px 24px; font-size: 14px; }
-    .filter-scroll-wrapper { margin: 0; padding: 0; overflow: visible; }
+    .filter-scroll-wrapper { margin: 0 0 20px 0; padding: 0; overflow: visible; }
     .filter-scroll-inner { flex-wrap: wrap; display: flex; }
     .card { display: grid; grid-template-columns: 180px 1fr auto; gap: 20px; padding: 16px; align-items: start; }
     .card-image { aspect-ratio: 4/3; height: 140px; width: 180px; }
@@ -1030,7 +1139,7 @@ async function saveSettings() {
 // ============================================================
 //  Tab Renderers
 // ============================================================
-async function renderListingsTab(env, url) {
+async function renderListingsTab(env, url, stats) {
   const filter = url.searchParams.get("filter") || "approved";
   const page = Math.max(1, parseInt(url.searchParams.get("page") || "1"));
   const offset = (page - 1) * PER_PAGE;
@@ -1039,10 +1148,9 @@ async function renderListingsTab(env, url) {
   if (filter === "approved") whereClause = "WHERE jev_done = 1 AND jev_score >= 0.7 AND status != 'archived' AND (jev_result IS NULL OR jev_result NOT LIKE '%\"rejected\":true%')";
   else if (filter === "favorite") whereClause = "WHERE status = 'favorite'";
   else if (filter === "archived") whereClause = "WHERE status = 'archived'";
-  else if (filter === "new") whereClause = "WHERE status = 'new' AND (jev_result IS NULL OR jev_result NOT LIKE '%\"rejected\":true%') AND extraction_done >= 0 AND jev_done >= 0";
+  else if (filter === "new") whereClause = "WHERE status = 'new' AND jev_done = 1 AND jev_score >= 0.7 AND (jev_result IS NULL OR jev_result NOT LIKE '%\"rejected\":true%')";
   else if (filter === "failed") whereClause = "WHERE extraction_done = -1 OR jev_done = -1";
   else if (filter === "pending") whereClause = "WHERE (extraction_done = 0 OR jev_done = 0) AND extraction_done >= 0 AND jev_done >= 0";
-  else if (filter === "rejected") whereClause = "WHERE jev_result LIKE '%\"rejected\":true%'";
 
   const [listingsRes, totalRes] = await Promise.all([
     env.DB.prepare(`
@@ -1071,12 +1179,17 @@ async function renderListingsTab(env, url) {
     </div>
   ` : "";
 
+  // 🔧 Reordered filters with counts, "Abgelehnt" removed
   const filterBtns = [
-    ["approved", "✅ Bestätigt"], ["all", "Alle"], ["favorite", "⭐ Favoriten"],
-    ["new", "🆕 Neu"], ["pending", "⏳ Wartend"], ["archived", "📦 Archiv"],
-    ["rejected", "⛔ Abgelehnt"], ["failed", "⚠️ Fehler"],
-  ].map(([key, label]) =>
-    `<a href="/?filter=${key}&page=1" class="filter-btn ${filter === key ? 'active' : ''}">${label}</a>`
+    ["approved", "✅ Bestätigt", stats?.approved || 0],
+    ["new", "🆕 Neu", stats?.new_count || 0],
+    ["favorite", "⭐ Favoriten", stats?.favorites || 0],
+    ["pending", "⏳ Wartend", stats?.pending || 0],
+    ["failed", "⚠️ Fehler", stats?.failed || 0],
+    ["archived", "📦 Archiv", stats?.archived || 0],
+    ["all", "Alle", stats?.total || 0],
+  ].map(([key, label, count]) =>
+    `<a href="/?filter=${key}&page=1" class="filter-btn ${filter === key ? 'active' : ''}">${label} <span class="filter-count">${count}</span></a>`
   ).join("");
 
   return `
@@ -1277,7 +1390,6 @@ function renderCardServer(l) {
         ? '<button class="retry" onclick="retryListing(' + l.id + ')">🔄 Retry</button>'
         : '<button onclick="toggleFavorite(' + l.id + ',\'' + l.status + '\')">' + favLabel + '</button>')
     + '<button onclick="toggleArchive(' + l.id + ',\'' + l.status + '\')">' + archLabel + '</button>'
-    + (isFailed ? '<span></span>' : '<span></span>')
     + '</div>'
     + '</div>';
 }
