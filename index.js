@@ -1129,6 +1129,19 @@ async function saveSettings() {
   msg.style.display = 'block';
   setTimeout(() => msg.style.display = 'none', 3000);
 }
+function formatLocalTime(utcString) {
+  if (!utcString) return '';
+  // SQLite format: "2025-01-15 13:45:00" → ISO UTC
+  const iso = utcString.replace(' ', 'T') + 'Z';
+  const d = new Date(iso);
+  if (isNaN(d)) return utcString;
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+       + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+document.querySelectorAll('[data-utc]').forEach(el => {
+  el.textContent = formatLocalTime(el.getAttribute('data-utc'));
+});
 </script>
 </body>
 </html>`;
@@ -1248,7 +1261,9 @@ async function renderLogsTab(env, url) {
       const snip = log.error || log.response_snippet || '–';
       return '<div class="log-card">'
         + '<div class="log-card-header">'
-        + '<span class="log-card-time">' + escHtml(log.created_at || '') + '</span>'
+        + '<span class="log-card-time" data-utc="' + escHtml(log.created_at || '') + '">'
+        +   escHtml(log.created_at || '')
+        + '</span>'
         + '<div style="display:flex;gap:6px;">'
         + '<span class="log-service ' + escHtml(log.service || '') + '">' + escHtml(log.service || '') + '</span>'
         + '<span class="' + statusCls + '">' + (log.status || '?') + '</span>'
